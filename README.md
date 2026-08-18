@@ -14,6 +14,8 @@ Everything runs locally. The application does not send prompts or source code to
 - Checks generated PHP files with `php -l`.
 - Runs CodeIgniter migrations against a local MySQL database.
 - Starts the generated website temporarily and checks that the home page responds.
+- Keeps a successful generated website running in an embedded live Preview tab.
+- Provides a button that opens the preview in a separate browser tab.
 - Makes one LLM-based correction attempt when generated code fails.
 - Uses a simple deterministic scaffold if the model still cannot produce working code.
 - Displays the generated files, retrieved documentation, runtime output, and a downloadable ZIP.
@@ -30,7 +32,7 @@ flowchart LR
     D --> E["PHP syntax check"]
     E --> F["CodeIgniter migration"]
     F --> G["Temporary webpage check"]
-    G --> H["Result and ZIP"]
+    G --> H["Live preview, result, and ZIP"]
     E --> I["Correction or basic fallback"]
     F --> I
     G --> I
@@ -201,6 +203,8 @@ storage/jobs/JOB_ID/project/
 
 The Streamlit ZIP excludes `vendor/`, `.env`, logs, and caches. Run `composer install --no-dev` and create an `.env` file after extracting a downloaded project elsewhere.
 
+The Preview tab embeds the working generated webpage. Its button can open the same page in a separate browser tab. The preview uses an available local port and remains active while Streamlit is running. Generating another project stops the previous preview.
+
 ## Project structure
 
 ```text
@@ -210,7 +214,7 @@ PHP-Vibe-Coder/
 │   ├── llm.py                          Offline Qwen loader and generation
 │   ├── vector_store.py                 Chroma retrieval and reranking
 │   ├── simple_agent.py                 Planning, generation, repair, fallback
-│   └── runner.py                       PHP, migration, and webpage checks
+│   └── runner.py                       Runtime checks and persistent preview server
 ├── scripts/
 │   └── build_document_index.py         Documentation parser and index builder
 ├── templates/
@@ -279,6 +283,7 @@ The model is intentionally small but still runs locally on the CPU. Close memory
 - The small model can misunderstand complex or vague prompts.
 - Plans are limited to 10 generated application files.
 - Only one generated project should be checked at a time because the runner uses port 8080.
+- Only the most recently generated working project has an active live preview.
 - Generated projects share the configured local MySQL database.
 - The fallback scaffold focuses on simple database lists rather than complex authentication or business logic.
 - The runtime check only requests the generated home page; it does not exercise every form or route.

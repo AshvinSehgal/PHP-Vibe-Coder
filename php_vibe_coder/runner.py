@@ -1,10 +1,105 @@
+import atexit
 import os
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+class CodeIgniterPreviewServer:
+    def __init__(self):
+        self.process = None
+        self.url = None
+        atexit.register(self.stop)
+
+    def start(self, workspace):
+        self.stop()
+        port = self.available_port()
+        command = [
+            "php",
+            "spark",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as error:
+            return {
+                "url": None,
+                "error": str(error),
+            }
+        self.url = f"http://127.0.0.1:{port}"
+        for unused_attempt in range(20):
+            if self.process.poll() is not None:
+                output = self.process.communicate()[0]
+                self.process = None
+                self.url = None
+                return {
+                    "url": None,
+                    "error": "The preview server stopped unexpectedly.\n" + output,
+                }
+            try:
+                response = urlopen(self.url, timeout=2)
+                html = response.read().decode("utf-8", errors="replace")
+                failure_words = ("Whoops!", "Fatal error", "Parse error", "DatabaseException")
+                if response.status < 400 and not any(word in html for word in failure_words):
+                    return {
+                        "url": self.url,
+                        "error": None,
+                    }
+                self.stop()
+                return {
+                    "url": None,
+                    "error": "The generated preview returned an application error.",
+                }
+            except HTTPError as error:
+                body = error.read().decode("utf-8", errors="replace")
+                self.stop()
+                return {
+                    "url": None,
+                    "error": f"Preview request failed with HTTP {error.code}.\n{body}",
+                }
+            except URLError:
+                time.sleep(0.5)
+        self.stop()
+        return {
+            "url": None,
+            "error": "The preview server did not start within 10 seconds.",
+        }
+
+    def stop(self):
+        if self.process is not None and self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.process.communicate()
+        self.process = None
+        self.url = None
+
+    def available_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+            server_socket.bind(("127.0.0.1", 0))
+            return server_socket.getsockname()[1]
 
 class CodeIgniterRunner:
     def run_command(self, command, workspace):
