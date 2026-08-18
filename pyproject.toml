@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php-vibe-coder"
+version = "0.2.0"
+description = "A beginner-friendly Streamlit PHP code generator"
+requires-python = ">=3.9"
+dependencies = [
+    "streamlit>=1.40",
+    "transformers>=4.51.0",
+    "torch",
+    "accelerate",
+    "chromadb>=1.0,<2",
+    "sentence-transformers>=5,<6",
+    "beautifulsoup4>=4.12",
+]
+
+[tool.setuptools.packages.find]
+include = ["php_vibe_coder*"]

@@ -1,0 +1,8 @@
+CI_ENVIRONMENT = development
+
+database.default.hostname = localhost
+database.default.database = php_vibe_coder
+database.default.username = root
+database.default.password =
+database.default.DBDriver = MySQLi
+database.default.port = 3306

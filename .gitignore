@@ -1,0 +1,82 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and generated package files
+.cache/
+.huggingface/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Generated projects, vector databases and exported output
+/storage/
+/outputs/
+/models/
+
+# Downloaded documentation used to build the local RAG index
+/knowledge/
+/docs/php/
+/docs/codeigniter/
+/docs/composer/
+/docs/mysql/
+/docs/security/
+
+# PHP and JavaScript dependencies
+vendor/
+node_modules/
+composer.phar
+*.phar
+
+# Local application and package-manager settings
+.composer/
+.streamlit/secrets.toml
+
+# CodeIgniter runtime files in the reusable template
+/templates/codeigniter-base/tests/
+/templates/codeigniter-base/phpunit.dist.xml
+/templates/codeigniter-base/writable/cache/*
+!/templates/codeigniter-base/writable/cache/index.html
+/templates/codeigniter-base/writable/debugbar/*
+!/templates/codeigniter-base/writable/debugbar/index.html
+/templates/codeigniter-base/writable/logs/*
+!/templates/codeigniter-base/writable/logs/index.html
+/templates/codeigniter-base/writable/session/*
+!/templates/codeigniter-base/writable/session/index.html
+/templates/codeigniter-base/writable/uploads/*
+!/templates/codeigniter-base/writable/uploads/index.html
+
+# Local databases, logs, archives and model weights
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.safetensors
+*.gguf
+*.onnx
+*.pt
+*.pth
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
