@@ -19,8 +19,10 @@ Everything runs locally. The application does not send prompts or source code to
 - Keeps a successful generated website running in an embedded live Preview tab.
 - Provides a button that opens the preview in a separate browser tab.
 - Generates responsive CSS and small dependency-free JavaScript alongside PHP and HTML.
-- Allows one, two, or three LLM-based correction attempts when generated code fails.
-- Optionally runs route, frontend-asset, and homepage smoke tests without PHPUnit.
+- Generates one to five application-specific HTTP tests for every project.
+- Repairs code and reruns the complete test suite without a preset attempt limit.
+- Detects a repeated unchanged error state and switches to the predictable scaffold instead of hanging.
+- Refactors working application files and reruns every check before delivery.
 - Optionally adds an Nginx example and a short deployment guide.
 - Uses a simple deterministic scaffold if the model still cannot produce working code.
 - Displays the generated files, retrieved documentation, runtime output, and a downloadable ZIP.
@@ -37,10 +39,13 @@ flowchart LR
     D --> E["PHP syntax check"]
     E --> F["CodeIgniter migration"]
     F --> G["Temporary webpage check"]
-    G --> H["Live preview, result, and ZIP"]
+    G --> J["Generated application tests"]
+    J --> K["Refactor after tests pass"]
+    K --> H["Live preview, result, and ZIP"]
     E --> I["Correction or basic fallback"]
     F --> I
     G --> I
+    J --> I
     I --> E
 ```
 
@@ -52,7 +57,7 @@ The documentation indexer reads downloaded files from `docs/`, optional local no
 4. Creates embeddings with `sentence-transformers/all-MiniLM-L6-v2`.
 5. Stores the chunks and embeddings in a local Chroma database.
 
-For each prompt, the vector store retrieves 12 candidates, combines semantic similarity with keyword overlap, and gives the best five sections to Qwen. The plan is limited to 12 application files to leave room for CSS and JavaScript while keeping generation manageable on a laptop.
+For each prompt, the vector store retrieves 30 documentation candidates plus project-guidance candidates, combines semantic similarity with keyword overlap, and gives the best five sections to Qwen. The plan is limited to 12 application files to leave room for CSS and JavaScript while keeping generation manageable on a laptop.
 
 ## Requirements
 
@@ -195,16 +200,16 @@ Try a small prompt first:
 Create a small CodeIgniter product list with product name and price stored in MySQL.
 ```
 
-Generation can take a minute or more because the model runs on the CPU and creates each file separately.
+Generation can take several minutes because the model runs on the CPU, creates each file and its tests separately, and performs another generation pass for refactoring.
 
-### Optional build settings
+### Existing projects and deployment settings
 
-Open **Optional build settings** beneath the prompt to configure a generation:
+Open **Optional build settings** beneath the prompt to configure these inputs:
 
 - **Existing CodeIgniter project ZIP** copies an existing project's usable files into a new job workspace. It ignores `.git`, `.env`, dependencies, logs, and caches. It rejects unsafe paths, symbolic links, more than 1,000 files, or more than 30 MB of extracted data. The original ZIP and original project are never modified.
-- **Maximum AI repair attempts** selects one, two, or three repair passes. Each pass reads the latest errors and regenerates only the likely affected files.
-- **Run optional minimal tests** checks registered routes, the required CSS and JavaScript files, and the homepage. It does not install PHPUnit.
 - **Add lightweight deployment files** adds `DEPLOYMENT.md` and `deploy/nginx.conf`. Local generation and preview do not depend on them.
+
+Testing and refactoring are automatic. They do not have checkboxes because every generated project must pass them before delivery.
 
 For an uploaded project, describe the change rather than the whole application:
 
@@ -230,6 +235,8 @@ The Streamlit ZIP excludes `vendor/`, `.env`, logs, and caches. Run `composer in
 
 The Preview tab embeds the working generated webpage. Its button can open the same page in a separate browser tab. The preview uses an available local port and remains active while Streamlit is running. Generating another project stops the previous preview.
 
+Every result also contains `tests/application_tests.json`. This is a small LLM-generated definition containing one to five public GET requests, expected HTTP status codes, and stable text that should appear on each page. The Python runner executes these tests without PHPUnit or another testing package.
+
 ## Project structure
 
 ```text
@@ -238,9 +245,9 @@ PHP-Vibe-Coder/
 ├── php_vibe_coder/
 │   ├── llm.py                          Offline Qwen loader and generation
 │   ├── vector_store.py                 Chroma retrieval and reranking
-│   ├── simple_agent.py                 Planning, generation, repair, fallback
+│   ├── simple_agent.py                 Straight generation, repair, and refactor workflow
 │   ├── project_archive.py              Safe existing-project ZIP extraction
-│   └── runner.py                       Runtime checks and persistent preview server
+│   └── runner.py                       Shared PHP server, checks, tests, and preview helpers
 ├── scripts/
 │   └── build_document_index.py         Documentation parser and index builder
 ├── templates/
@@ -264,9 +271,11 @@ php spark migrate
 php spark serve --host 127.0.0.1 --port AVAILABLE_PORT
 ```
 
-If code fails, the agent asks Qwen to repair the likely affected files up to the selected limit. It validates and reruns the project after every attempt. If errors remain, it replaces the planned application files with a small predictable scaffold and checks again. Database connection failures and missing local programs are reported as environment errors because changing generated PHP cannot fix them.
+If code or a test fails, the agent asks Qwen to repair the likely affected files and then reruns framework checks, PHP linting, migrations, the homepage check, route checks, asset checks, and every generated application test. There is no preset repair-attempt number. Database connection failures and missing local programs are reported as environment errors because changing generated PHP cannot fix them.
 
-Optional minimal-test failures participate in the same loop, so a route, asset, or homepage failure can trigger a repair.
+The loop stops only for an environment problem or when the exact same files and errors repeat, showing that the deterministic local model is no longer making progress. In the repeated-state case, the agent switches to the predictable scaffold and tests it. This protects the laptop from an endless non-progressing loop without imposing an arbitrary attempt count.
+
+After all tests pass, Qwen performs one behavior-preserving refactoring pass over controllers, models, views, CSS, and JavaScript. The complete validation and test sequence runs again. If refactoring introduces a failure, that failure returns to the same repair loop before delivery.
 
 ## Troubleshooting
 
@@ -307,11 +316,12 @@ The model is intentionally small but still runs locally on the CPU. Close memory
 ## Current limitations
 
 - The small model can misunderstand complex or vague prompts.
+- There is no numeric repair cap, so a build can run longer while each repair continues producing a genuinely new code state.
 - Plans are limited to 12 generated application files.
 - Only the most recently generated working project has an active live preview.
 - Generated projects share the configured local MySQL database.
 - The fallback scaffold focuses on simple database lists rather than complex authentication or business logic.
-- The optional tests remain deliberately small; they do not submit every form or exercise every route.
+- Generated tests deliberately use safe public GET requests; they do not submit forms, modify database rows, or test authenticated workflows.
 - Generated authentication, authorization, payments, uploads, and other sensitive features require manual security review.
 - PDF documentation is not indexed.
 - Deployment output is a starting point and still requires server-specific values, HTTPS, security review, and operational setup.

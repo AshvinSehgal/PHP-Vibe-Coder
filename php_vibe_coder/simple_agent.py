@@ -2,6 +2,7 @@ import re
 import uuid
 import shutil
 import json
+from hashlib import sha256
 from pathlib import Path
 from .runner import CodeIgniterRunner
 from .project_archive import extract_project_zip
@@ -15,74 +16,35 @@ class SimplePHPAgent:
         self.template_dir = self.root / "templates" / "codeigniter-base"
         self.runner = CodeIgniterRunner()
 
-    def build(self, prompt, existing_project=None, repair_attempts=2, run_minimal_tests=False, include_deployment=True):
-        repair_attempts = max(1, min(3, int(repair_attempts)))
+    def build(self, prompt, existing_project=None, include_deployment=True):
         workspace = self.create_workspace()
         imported_files = []
         if existing_project:
             imported_files = extract_project_zip(existing_project, workspace)
         project_context = self.read_project_context(workspace, imported_files) if imported_files else ""
-        retrieval_prompt = prompt + "\n" + project_context[:3000]
-        knowledge = self.retrieve(retrieval_prompt)
+        knowledge = self.retrieve(prompt + "\n" + project_context[:3000])
         plan = self.create_plan(prompt, knowledge, project_context)
         plan = self.prepare_plan(plan, prompt)
         self.validate_plan(plan)
-        files = self.generate_code(prompt, plan, knowledge, project_context)
-        planned_files = set(plan["files"])
-        generated_files = set(files)
-        missing_files = planned_files - generated_files
-        extra_files = generated_files - planned_files
+        files = self.generate_code(prompt, plan, project_context)
+        missing_files = set(plan["files"]) - set(files)
+        extra_files = set(files) - set(plan["files"])
         if missing_files:
             raise ValueError("The LLM did not generate: " + ", ".join(sorted(missing_files)))
         if extra_files:
             raise ValueError("The LLM generated unplanned files: " + ", ".join(sorted(extra_files)))
         self.write_files(workspace, files)
-        support_files = {}
-        if include_deployment:
-            support_files = self.deployment_files()
-            self.write_files(workspace, support_files)
+        support_files = self.deployment_files() if include_deployment else {}
+        self.write_files(workspace, support_files)
         attempts = []
-        test_results = []
-        errors = self.check_generated_code(workspace, plan)
+        errors, test_results = self.repair_until_tests_pass(prompt, plan, workspace, attempts)
+        refactoring = {"performed": False, "changed_files": []}
         if not errors:
-            errors = self.runner.check(workspace, plan["files"])
-        if not errors and run_minimal_tests:
-            test_results, errors = self.runner.run_minimal_tests(workspace)
-        for attempt in range(1, repair_attempts + 1):
-            if not errors:
-                break
-            environment_errors = [error for error in errors if error.get("kind") == "environment"]
-            if environment_errors:
-                break
-            corrected_files = self.correct_code(prompt, plan, knowledge, workspace, errors)
-            if not corrected_files:
-                break
-            self.write_files(workspace, corrected_files)
-            attempts.append({
-                "number": attempt,
-                "errors": errors,
-                "changed_files": list(
-                    corrected_files
-                ),
-            })
-            errors = self.check_generated_code(workspace, plan)
-            if not errors:
-                errors = self.runner.check(workspace, plan["files"])
-            if not errors and run_minimal_tests:
-                test_results, errors = self.runner.run_minimal_tests(workspace)
-        if errors and not any(error.get("kind") == "environment" for error in errors):
-            fallback_files = self.basic_fallback_files(plan)
-            self.write_files(workspace, fallback_files)
-            attempts.append({
-                "number": "basic scaffold",
-                "errors": errors,
-                "changed_files": list(fallback_files),
-            })
-            errors = self.check_generated_code(workspace, plan)
-            if not errors:
-                errors = self.runner.check(workspace, plan["files"])
-            if not errors and run_minimal_tests:
-                test_results, errors = self.runner.run_minimal_tests(workspace)
+            refactored_files = self.refactor_code(prompt, plan, workspace)
+            refactoring = {"performed": True, "changed_files": list(refactored_files)}
+            if refactored_files:
+                self.write_files(workspace, refactored_files)
+            errors, test_results = self.repair_until_tests_pass(prompt, plan, workspace, attempts)
         if not errors:
             status = "working"
         elif any(error.get("kind") == "environment" for error in errors):
@@ -100,11 +62,71 @@ class SimplePHPAgent:
             "errors": errors,
             "attempts": attempts,
             "imported_files": imported_files,
-            "tests_enabled": run_minimal_tests,
             "test_results": test_results,
-            "repair_limit": repair_attempts,
+            "refactoring": refactoring,
             "deployment_included": include_deployment,
         }
+
+    def validate_and_test(self, workspace, plan):
+        errors = self.check_generated_code(workspace, plan)
+        if not errors:
+            errors = self.runner.check(workspace, plan["files"])
+        test_results = []
+        if not errors:
+            test_results, errors = self.runner.run_application_tests(workspace)
+        return errors, test_results
+
+    def repair_until_tests_pass(self, prompt, plan, workspace, attempts):
+        errors, test_results = self.validate_and_test(workspace, plan)
+        seen_states = set()
+        fallback_used = False
+        while errors:
+            if any(error.get("kind") == "environment" for error in errors):
+                break
+            state = self.repair_state(workspace, plan, errors)
+            if state in seen_states:
+                if fallback_used:
+                    break
+                fallback_files = self.fallback_files_for_errors(plan, errors)
+                self.write_files(workspace, fallback_files)
+                attempts.append({
+                    "number": "basic scaffold",
+                    "errors": errors,
+                    "changed_files": list(fallback_files),
+                })
+                fallback_used = True
+                seen_states.clear()
+                errors, test_results = self.validate_and_test(workspace, plan)
+                continue
+            seen_states.add(state)
+            corrected_files = self.correct_code(prompt, plan, workspace, errors)
+            if not corrected_files:
+                break
+            self.write_files(workspace, corrected_files)
+            attempts.append({
+                "number": len([item for item in attempts if isinstance(item["number"], int)]) + 1,
+                "errors": errors,
+                "changed_files": list(corrected_files),
+            })
+            errors, test_results = self.validate_and_test(workspace, plan)
+        return errors, test_results
+
+    def fallback_files_for_errors(self, plan, errors):
+        test_only = all(
+            "tests/application_tests.json" in error.get("output", "")
+            or "test-definition" in error.get("command", [])
+            for error in errors
+        )
+        if test_only:
+            return {
+                "tests/application_tests.json": self.basic_application_tests(self.primary_entity(plan))
+            }
+        return self.basic_fallback_files(plan)
+
+    def repair_state(self, workspace, plan, errors):
+        current_files = self.read_generated_files(workspace, plan)
+        state = json.dumps({"files": current_files, "errors": errors}, sort_keys=True)
+        return sha256(state.encode("utf-8")).hexdigest()
 
     def retrieve(self, prompt):
         if self.vector_store is not None:
@@ -128,14 +150,14 @@ class SimplePHPAgent:
 
     def words(self, text):
         return set(re.findall(r"[a-zA-Z][a-zA-Z0-9]+", text.lower()))
-    
+
     def knowledge_text(self, knowledge):
         sections = []
         for item in knowledge:
             text = item["text"][:2200]
             sections.append(f"SOURCE: {item['source']}\n{text}")
         return "\n\n".join(sections)
-    
+
     def create_plan(self, prompt, knowledge, project_context=""):
         system_prompt = """
         You are a beginner-friendly PHP and CodeIgniter planner.
@@ -165,7 +187,7 @@ class SimplePHPAgent:
         - Do not include vendor files.
         - Do not include framework source files.
         - For a webpage, include public/css/app.css and public/js/app.js.
-        - Do not include automated test files or deployment files; the application adds those separately.
+        - Do not include test or deployment files in the JSON plan; the application reserves those separately.
         - When existing project code is supplied, preserve its useful structure and plan only files that must be created or changed.
         """
 
@@ -221,6 +243,7 @@ class SimplePHPAgent:
         )
         if needs_view and not has_view and len(files) < 12:
             files.append("app/Views/index.php")
+            has_view = True
         database_requested = re.search(
             r"\b(database|mysql|table|stored?|save|crud)\b",
             prompt,
@@ -239,10 +262,6 @@ class SimplePHPAgent:
             if len(files) + len(database_files) > 12:
                 raise ValueError("The database plan needs a model and migration but exceeds 12 files")
             files.extend(database_files)
-        has_view = any(
-            filename.startswith("app/Views/")
-            for filename in files if isinstance(filename, str)
-        )
         if has_view:
             missing_assets = [
                 asset for asset in ("public/css/app.css", "public/js/app.js")
@@ -251,6 +270,8 @@ class SimplePHPAgent:
             if len(files) + len(missing_assets) > 12:
                 raise ValueError("The webpage plan needs CSS and JavaScript but exceeds 12 files")
             files.extend(missing_assets)
+        if "tests/application_tests.json" not in files:
+            files.append("tests/application_tests.json")
         plan["files"] = list(dict.fromkeys(files))
         return plan
     
@@ -262,14 +283,15 @@ class SimplePHPAgent:
             raise ValueError("The plan must contain a files list")
         if not files:
             raise ValueError("The LLM returned an empty file plan")
-        if len(files) > 12:
-            raise ValueError("The LLM planned more than 12 files")
+        application_files = [filename for filename in files if not filename.startswith("tests/")]
+        if len(application_files) > 12:
+            raise ValueError("The LLM planned more than 12 application files")
         if len(files) != len(set(files)):
             raise ValueError("The LLM planned duplicate files")
         for filename in files:
             self.validate_filename(filename)
     
-    def generate_code(self, prompt, plan, knowledge, project_context=""):
+    def generate_code(self, prompt, plan, project_context=""):
         system_prompt = """
         Generate one small, complete CodeIgniter 4 file.
         Return code only, with no Markdown fence or explanation.
@@ -346,6 +368,15 @@ class SimplePHPAgent:
                 "enhance forms safely, ask before destructive actions, and add no feature that "
                 "requires missing HTML or a backend route."
             )
+        if filename == "tests/application_tests.json":
+            return (
+                "Return valid JSON with this exact shape: "
+                "{\"tests\":[{\"name\":\"clear test name\",\"method\":\"GET\","
+                "\"path\":\"/\",\"expected_status\":200,\"contains\":[\"visible expected text\"]}]}. "
+                "Generate one to five application-specific GET tests from the user request and planned routes. "
+                "Only test public pages that can run without login or submitted form data. "
+                "Use stable headings, labels or page text in contains, never database rows or changing values."
+            )
         return "Generate the complete requested file using plain beginner-friendly PHP."
 
     def file_token_limit(self, filename):
@@ -357,6 +388,8 @@ class SimplePHPAgent:
             return 420
         if filename.endswith((".css", ".js")):
             return 420
+        if filename == "tests/application_tests.json":
+            return 360
         return 280
 
     def entity_fields(self, plan):
@@ -421,6 +454,8 @@ class SimplePHPAgent:
                 files[filename] = self.basic_css()
             elif filename == "public/js/app.js":
                 files[filename] = self.basic_javascript()
+            elif filename == "tests/application_tests.json":
+                files[filename] = self.basic_application_tests(entity)
         return files
 
     def basic_migration(self, filename, table, fields):
@@ -511,6 +546,20 @@ class SimplePHPAgent:
             "});\n"
         )
 
+    def basic_application_tests(self, entity):
+        tests = {
+            "tests": [
+                {
+                    "name": f"{entity} page loads",
+                    "method": "GET",
+                    "path": "/",
+                    "expected_status": 200,
+                    "contains": [f"{entity} List"],
+                }
+            ]
+        }
+        return json.dumps(tests, indent=2) + "\n"
+
     def clean_file_content(self, answer, filename):
         if not isinstance(answer, str):
             raise ValueError(f"The LLM returned invalid contents for {filename}")
@@ -530,49 +579,6 @@ class SimplePHPAgent:
         if not answer.strip():
             raise ValueError(f"The LLM returned an empty file: {filename}")
         return answer.strip() + "\n"
-    
-    def parse_file_blocks(self, answer):
-        if not isinstance(answer, str):
-            raise ValueError("The LLM file response must be text")
-        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
-        pattern = (
-            r"<<<FILE\s*:?\s*(.+?)>>>\s*\n?"
-            r"(.*?)"
-            r"\n?<<<END[_ ]FILE>>>"
-        )
-        matches = re.findall(pattern, answer, flags=re.DOTALL)
-        if not matches:
-            start = answer.find("{")
-            end = answer.rfind("}")
-            if start != -1 and end > start:
-                json_text = answer[start:end + 1]
-                json_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_text)
-                try:
-                    data = json.loads(json_text)
-                    items = data.get("files", [])
-                    matches = [
-                        (item.get("path", ""), item.get("content", ""))
-                        for item in items
-                        if isinstance(item, dict)
-                    ]
-                except json.JSONDecodeError:
-                    matches = []
-        if not matches:
-            preview = answer.strip()[:1500]
-            raise ValueError("The LLM did not return recognizable files. Response preview:\n" + preview)
-        files = {}
-        for filename, contents in matches:
-            if not isinstance(filename, str) or not isinstance(contents, str):
-                raise ValueError("Every LLM file needs a text path and text contents")
-            filename = filename.strip()
-            contents = contents.strip()
-            self.validate_filename(filename)
-            if filename in files:
-                raise ValueError(f"The LLM generated a duplicate file: {filename}")
-            if not contents:
-                raise ValueError(f"The LLM returned an empty file: {filename}")
-            files[filename] = contents + "\n"
-        return files
     
     def create_workspace(self):
         job_id = uuid.uuid4().hex[:8]
@@ -656,7 +662,7 @@ class SimplePHPAgent:
             raise ValueError("Absolute paths are not allowed")
         if ".." in relative.parts:
             raise ValueError("Parent-directory paths are not allowed")
-        allowed_folders = ("app/", "public/", "writable/", "deploy/")
+        allowed_folders = ("app/", "public/", "writable/", "deploy/", "tests/")
         allowed_files = ("DEPLOYMENT.md",)
         if not filename.startswith(allowed_folders) and filename not in allowed_files:
             raise ValueError(f"Generated path is not allowed: {filename}")
@@ -690,6 +696,8 @@ class SimplePHPAgent:
                 problems.append("view does not load app.css")
             if filename.startswith("app/Views/") and "public/js/app.js" in plan["files"] and "app.js" not in contents:
                 problems.append("view does not load app.js")
+            if filename == "tests/application_tests.json":
+                problems.extend(self.test_definition_problems(contents))
             if re.search(r"function\s+\w+\s*\([^)]*\b(?:array|string|int|float|bool)\s+\$", contents):
                 problems.append("PHP parameter type declaration")
             if problems:
@@ -702,16 +710,41 @@ class SimplePHPAgent:
                     "kind": "code",
                 })
         return errors
-    
-    def correct_code(self, prompt, plan, knowledge, workspace,errors):
-        current_files = self.read_generated_files(workspace, plan)
-        system_prompt = """
-        Repair one small, complete CodeIgniter 4 file.
-        Return code only, with no Markdown fence or explanation.
-        Never use Laravel or Illuminate. Never use PHP type declarations.
-        Keep the file under 50 lines and close every class, method and HTML tag.
-        """
 
+    def test_definition_problems(self, contents):
+        try:
+            definition = json.loads(contents)
+        except json.JSONDecodeError as error:
+            return [f"invalid test JSON: {error}"]
+        tests = definition.get("tests") if isinstance(definition, dict) else None
+        if not isinstance(tests, list) or not 1 <= len(tests) <= 5:
+            return ["test JSON must contain between one and five tests"]
+        problems = []
+        for number, test in enumerate(tests, start=1):
+            if not isinstance(test, dict):
+                problems.append(f"test {number} must be an object")
+                continue
+            if not isinstance(test.get("name"), str) or not test["name"].strip():
+                problems.append(f"test {number} needs a name")
+            if test.get("method") != "GET":
+                problems.append(f"test {number} must use GET")
+            path = test.get("path")
+            if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+                problems.append(f"test {number} needs a safe root-relative path")
+            elif not re.fullmatch(r"/[a-zA-Z0-9_/?&=.%-]*", path):
+                problems.append(f"test {number} path contains unsupported characters")
+            status = test.get("expected_status")
+            if not isinstance(status, int) or not 100 <= status <= 599:
+                problems.append(f"test {number} needs a valid expected_status")
+            contains = test.get("contains")
+            if not isinstance(contains, list) or not contains:
+                problems.append(f"test {number} needs at least one contains value")
+            elif any(not isinstance(value, str) or not value.strip() for value in contains):
+                problems.append(f"test {number} contains values must be non-empty text")
+        return problems
+    
+    def correct_code(self, prompt, plan, workspace, errors):
+        current_files = self.read_generated_files(workspace, plan)
         error_text = json.dumps(errors)
         targets = [
             filename for filename in plan["files"]
@@ -733,6 +766,12 @@ class SimplePHPAgent:
                     if filename == "app/Config/Routes.php"
                     or filename.startswith("app/Controllers/")
                 ]
+            elif "application-test" in commands:
+                targets = [
+                    filename for filename in plan["files"]
+                    if filename == "app/Config/Routes.php"
+                    or filename.startswith(("app/Controllers/", "app/Views/"))
+                ]
             else:
                 targets = plan["files"][:1]
         corrected = {}
@@ -748,12 +787,62 @@ class SimplePHPAgent:
             {current_files.get(filename, "")}
             """
             answer = self.llm.generate(
-                system_prompt,
+                self.repair_system_prompt(filename),
                 user_prompt,
                 max_new_tokens=self.file_token_limit(filename),
             )
             corrected[filename] = self.clean_file_content(answer, filename)
         return corrected
+
+    def repair_system_prompt(self, filename):
+        if filename == "tests/application_tests.json":
+            return (
+                "Repair one application test definition. Return valid JSON only, with no Markdown fence or explanation. "
+                "Keep the tests faithful to the user request and only assert stable public page content."
+            )
+        return """
+        Repair one small, complete CodeIgniter 4 file.
+        Return code only, with no Markdown fence or explanation.
+        Never use Laravel or Illuminate. Never use PHP type declarations.
+        Keep the file under 60 lines and close every class, method and HTML tag.
+        """
+
+    def refactor_code(self, prompt, plan, workspace):
+        current_files = self.read_generated_files(workspace, plan)
+        targets = [
+            filename for filename in plan["files"]
+            if filename.startswith(("app/Controllers/", "app/Models/", "app/Views/", "public/css/", "public/js/"))
+        ]
+        refactored = {}
+        entity = self.primary_entity(plan)
+        for filename in targets:
+            system_prompt = """
+            Refactor one working CodeIgniter 4 application file for clarity and maintainability.
+            Return the complete file only, with no Markdown fence or explanation.
+            Preserve routes, behavior, view variables, visible text and all test expectations.
+            Do not add or remove features. Never use PHP type declarations, Laravel, external packages or CDNs.
+            Keep the implementation beginner-friendly and close every class, method and HTML tag.
+            """
+            user_prompt = f"""
+            Refactor only this file: {filename}
+            User request: {prompt}
+            Main entity: {entity}
+            Required pattern: {self.file_guidance(filename, entity)}
+            Current working code:
+            {current_files.get(filename, "")}
+            """
+            try:
+                answer = self.llm.generate(
+                    system_prompt,
+                    user_prompt,
+                    max_new_tokens=self.file_token_limit(filename),
+                )
+                contents = self.clean_file_content(answer, filename)
+            except (ValueError, RuntimeError):
+                continue
+            if contents != current_files.get(filename):
+                refactored[filename] = contents
+        return refactored
 
     def read_generated_files(self, workspace, plan):
         files = {}

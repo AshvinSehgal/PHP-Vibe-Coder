@@ -9,10 +9,9 @@ from sentence_transformers import SentenceTransformer
 
 class VectorStore:
     def __init__(self, root):
-        self.root = Path(root)
-        self.database_directory = (self.root / "storage" / "vector_database")
+        self.database_directory = Path(root) / "storage" / "vector_database"
         self.collection_name = "php_docs"
-        self.embedding_model_name = ("sentence-transformers/all-MiniLM-L6-v2")
+        self.embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
         self.client = None
         self.collection = None
         self.model = None
@@ -29,7 +28,7 @@ class VectorStore:
             device="cpu",
             local_files_only=True,
         )
-        
+
     def search(self, prompt, limit=5):
         self.load()
         query_embedding = self.model.encode(
@@ -59,29 +58,21 @@ class VectorStore:
         matches = []
         seen = set()
         for document, metadata, distance in zip(documents, metadatas, distances):
-            if metadata.get("category") == "project-guidance":
-                source_key = (metadata.get("source"), "guidance")
-            else:
-                source_key = (metadata.get("source"), metadata.get("chunk"))
+            source = metadata.get("source", "documentation")
+            chunk = "guidance" if metadata.get("category") == "project-guidance" else metadata.get("chunk")
+            source_key = (source, chunk)
             if source_key in seen:
                 continue
             seen.add(source_key)
-            document_words = self.words(document)
-            keyword_matches = len(query_words & document_words)
+            keyword_matches = len(query_words & self.words(document))
             semantic_score = 1 / (1 + distance)
             keyword_score = keyword_matches / max(1, len(query_words))
             guidance_score = 0.3 if metadata.get("category") == "project-guidance" else 0
             matches.append({
-                "source": metadata.get(
-                    "source",
-                    "documentation",
-                ),
+                "source": source,
                 "text": document,
                 "score": semantic_score + keyword_score + guidance_score,
-                "category": metadata.get(
-                    "category",
-                    "unknown",
-                ),
+                "category": metadata.get("category", "unknown"),
             })
         matches.sort(key=lambda item: item["score"], reverse=True)
         return matches[:limit]

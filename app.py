@@ -39,18 +39,6 @@ with st.expander("Optional build settings"):
         type="zip",
         help="Upload a small existing project when you want the agent to understand and update it.",
     )
-    repair_attempts = st.slider(
-        "Maximum AI repair attempts",
-        min_value=1,
-        max_value=3,
-        value=2,
-        help="More attempts can fix additional errors but take longer on a laptop.",
-    )
-    run_minimal_tests = st.checkbox(
-        "Run optional minimal tests",
-        value=False,
-        help="Checks registered routes and the generated page without installing PHPUnit.",
-    )
     include_deployment = st.checkbox(
         "Add lightweight deployment files",
         value=True,
@@ -73,8 +61,6 @@ if st.button("Generate PHP project", type="primary"):
                 st.session_state.result = agent.build(
                     prompt,
                     existing_project=archive_bytes,
-                    repair_attempts=repair_attempts,
-                    run_minimal_tests=run_minimal_tests,
                     include_deployment=include_deployment,
                 )
                 if st.session_state.result["status"] == "working":
@@ -88,7 +74,7 @@ if st.button("Generate PHP project", type="primary"):
 
 result = st.session_state.result
 if result:
-    message = (f"Generated {len(result['files'])} files in {result['workspace']}")
+    message = f"Generated {len(result['files'])} files in {result['workspace']}"
     if result["status"] == "working":
         st.success(message)
     elif result["status"] == "environment_error":
@@ -146,17 +132,24 @@ if result:
         elif result["status"] == "environment_error":
             st.warning("The local environment prevented the application from running.")
         else:
-            st.error("The application still contains errors after the correction attempts.")
+            st.error("The application still contains errors after the repair loop and fallback checks.")
         if result["errors"]:
             for number, error in enumerate(result["errors"], start=1):
                 st.subheader(f"Error {number}: {error.get('kind', 'unknown')}")
                 st.code(error["output"])
-        st.write("Correction attempts:", len(result["attempts"]))
-        if result.get("tests_enabled"):
-            st.subheader("Minimal tests")
-            for test in result.get("test_results", []):
-                if test["passed"]:
-                    st.success(test["name"])
-                else:
-                    st.error(test["name"])
-                st.code(test["output"])
+        st.write("Repair actions:", len(result["attempts"]))
+        refactoring = result.get("refactoring", {})
+        if refactoring.get("performed"):
+            st.success(f"The refactoring pass completed, changed {len(refactoring['changed_files'])} files, and reran the full test suite.")
+        else:
+            st.info("No refactoring changes were needed or the build stopped on an environment error.")
+        st.subheader("Application tests")
+        test_results = result.get("test_results", [])
+        if not test_results:
+            st.info("Application tests could not run because an earlier validation or environment check failed.")
+        for test in test_results:
+            if test["passed"]:
+                st.success(test["name"])
+            else:
+                st.error(test["name"])
+            st.code(test["output"])
