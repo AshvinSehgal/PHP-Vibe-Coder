@@ -7,7 +7,9 @@ Everything runs locally. The application does not send prompts or source code to
 ## What it does
 
 - Accepts a plain-English application request in Streamlit.
+- Optionally imports an existing CodeIgniter project ZIP so the model can understand and update it.
 - Searches locally downloaded PHP, CodeIgniter, Composer, MySQL, and OWASP documentation.
+- Includes project coding standards and beginner-friendly design patterns in vector search.
 - Uses `Qwen/Qwen2.5-Coder-0.5B-Instruct` for planning and code generation.
 - Generates a small CodeIgniter project with controllers, models, views, routes, and migrations.
 - Avoids PHP type declarations in generated application files.
@@ -16,7 +18,10 @@ Everything runs locally. The application does not send prompts or source code to
 - Starts the generated website temporarily and checks that the home page responds.
 - Keeps a successful generated website running in an embedded live Preview tab.
 - Provides a button that opens the preview in a separate browser tab.
-- Makes one LLM-based correction attempt when generated code fails.
+- Generates responsive CSS and small dependency-free JavaScript alongside PHP and HTML.
+- Allows one, two, or three LLM-based correction attempts when generated code fails.
+- Optionally runs route, frontend-asset, and homepage smoke tests without PHPUnit.
+- Optionally adds an Nginx example and a short deployment guide.
 - Uses a simple deterministic scaffold if the model still cannot produce working code.
 - Displays the generated files, retrieved documentation, runtime output, and a downloadable ZIP.
 
@@ -26,7 +31,7 @@ This is an educational local project generator, not a production deployment syst
 
 ```mermaid
 flowchart LR
-    A["User prompt"] --> B["Local documentation search"]
+    A["Prompt and optional project ZIP"] --> B["Local documentation search"]
     B --> C["Qwen creates a plan"]
     C --> D["Qwen generates each file"]
     D --> E["PHP syntax check"]
@@ -39,15 +44,15 @@ flowchart LR
     I --> E
 ```
 
-The documentation indexer:
+The documentation indexer reads downloaded files from `docs/`, optional local notes from `knowledge/`, and maintained project guidance from `rag_sources/`. It then:
 
-1. Reads `.html`, `.htm`, `.md`, and `.txt` files from `docs/`.
+1. Reads `.html`, `.htm`, `.md`, and `.txt` files from those source folders.
 2. Removes HTML navigation, scripts, styles, headers, and footers.
 3. Splits text into approximately 1,600-character chunks with a small overlap.
 4. Creates embeddings with `sentence-transformers/all-MiniLM-L6-v2`.
 5. Stores the chunks and embeddings in a local Chroma database.
 
-For each prompt, the vector store retrieves 12 candidates, combines semantic similarity with keyword overlap, and gives the best five sections to Qwen. The plan is limited to 10 application files to keep generation manageable on a laptop.
+For each prompt, the vector store retrieves 12 candidates, combines semantic similarity with keyword overlap, and gives the best five sections to Qwen. The plan is limited to 12 application files to leave room for CSS and JavaScript while keeping generation manageable on a laptop.
 
 ## Requirements
 
@@ -168,6 +173,11 @@ python scripts/build_document_index.py
 
 The index is written to `storage/vector_database/`. Building the complete PHP manual can take time because it contains thousands of pages. The finished database is reusable and only needs to be rebuilt when the documentation changes.
 
+The repository includes two small sources that are indexed automatically:
+
+- `rag_sources/coding-standards.md` explains the expected CodeIgniter structure, security rules, and frontend conventions.
+- `rag_sources/design-patterns.md` explains MVC, model boundaries, service layers, validation, Post/Redirect/Get, and migrations.
+
 ## Running the application
 
 Make sure MySQL is running, activate the Python environment, and start Streamlit:
@@ -186,6 +196,21 @@ Create a small CodeIgniter product list with product name and price stored in My
 ```
 
 Generation can take a minute or more because the model runs on the CPU and creates each file separately.
+
+### Optional build settings
+
+Open **Optional build settings** beneath the prompt to configure a generation:
+
+- **Existing CodeIgniter project ZIP** copies an existing project's usable files into a new job workspace. It ignores `.git`, `.env`, dependencies, logs, and caches. It rejects unsafe paths, symbolic links, more than 1,000 files, or more than 30 MB of extracted data. The original ZIP and original project are never modified.
+- **Maximum AI repair attempts** selects one, two, or three repair passes. Each pass reads the latest errors and regenerates only the likely affected files.
+- **Run optional minimal tests** checks registered routes, the required CSS and JavaScript files, and the homepage. It does not install PHPUnit.
+- **Add lightweight deployment files** adds `DEPLOYMENT.md` and `deploy/nginx.conf`. Local generation and preview do not depend on them.
+
+For an uploaded project, describe the change rather than the whole application:
+
+```text
+Add a search box to the uploaded product list and keep its existing layout.
+```
 
 ## Understanding the result
 
@@ -214,12 +239,15 @@ PHP-Vibe-Coder/
 │   ├── llm.py                          Offline Qwen loader and generation
 │   ├── vector_store.py                 Chroma retrieval and reranking
 │   ├── simple_agent.py                 Planning, generation, repair, fallback
+│   ├── project_archive.py              Safe existing-project ZIP extraction
 │   └── runner.py                       Runtime checks and persistent preview server
 ├── scripts/
 │   └── build_document_index.py         Documentation parser and index builder
 ├── templates/
 │   └── codeigniter-base/               Reusable CodeIgniter starter project
 ├── docs/                               Local documentation, ignored by Git
+├── knowledge/                          Optional local notes, ignored by Git
+├── rag_sources/                        Versioned standards and design patterns
 ├── storage/
 │   ├── vector_database/                Generated Chroma index, ignored by Git
 │   └── jobs/                           Generated projects, ignored by Git
@@ -233,10 +261,12 @@ After generation, the agent checks framework conventions and PHP syntax. It then
 
 ```bash
 php spark migrate
-php spark serve --host 127.0.0.1 --port 8080
+php spark serve --host 127.0.0.1 --port AVAILABLE_PORT
 ```
 
-If code fails, the agent asks Qwen to repair the affected file once. If errors remain, it replaces the planned files with a small predictable scaffold. Database connection failures and missing local programs are reported as environment errors because changing generated PHP cannot fix them.
+If code fails, the agent asks Qwen to repair the likely affected files up to the selected limit. It validates and reruns the project after every attempt. If errors remain, it replaces the planned application files with a small predictable scaffold and checks again. Database connection failures and missing local programs are reported as environment errors because changing generated PHP cannot fix them.
+
+Optional minimal-test failures participate in the same loop, so a route, asset, or homepage failure can trigger a repair.
 
 ## Troubleshooting
 
@@ -251,7 +281,7 @@ hf download sentence-transformers/all-MiniLM-L6-v2
 
 ### The documentation index has not been built
 
-Confirm that supported files exist under `docs/`, then run:
+Confirm that supported files exist under `docs/`, `knowledge/`, or `rag_sources/`, then run:
 
 ```bash
 python scripts/build_document_index.py
@@ -270,10 +300,6 @@ composer install --no-dev
 
 Check that MySQL is running, the `php_vibe_coder` database exists, and the settings in `templates/codeigniter-base/.env` are correct. Also confirm that PHP has the `mysqli` extension enabled.
 
-### Port 8080 is already in use
-
-The runtime checker temporarily uses port 8080. Stop the application currently using that port before generating another project.
-
 ### Generation is slow
 
 The model is intentionally small but still runs locally on the CPU. Close memory-heavy applications and begin with a request that needs only a few files.
@@ -281,15 +307,14 @@ The model is intentionally small but still runs locally on the CPU. Close memory
 ## Current limitations
 
 - The small model can misunderstand complex or vague prompts.
-- Plans are limited to 10 generated application files.
-- Only one generated project should be checked at a time because the runner uses port 8080.
+- Plans are limited to 12 generated application files.
 - Only the most recently generated working project has an active live preview.
 - Generated projects share the configured local MySQL database.
 - The fallback scaffold focuses on simple database lists rather than complex authentication or business logic.
-- The runtime check only requests the generated home page; it does not exercise every form or route.
+- The optional tests remain deliberately small; they do not submit every form or exercise every route.
 - Generated authentication, authorization, payments, uploads, and other sensitive features require manual security review.
 - PDF documentation is not indexed.
-- The project is intended for local development and learning, not direct production deployment.
+- Deployment output is a starting point and still requires server-specific values, HTTPS, security review, and operational setup.
 
 ## Files intentionally excluded from GitHub
 

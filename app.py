@@ -33,6 +33,29 @@ preview_server = load_preview_server()
 
 default_prompt = "Create a customer registration system with login, a MySQL database and a simple admin page."
 prompt = st.text_area("Describe the PHP application", default_prompt, height=140)
+with st.expander("Optional build settings"):
+    existing_project = st.file_uploader(
+        "Existing CodeIgniter project ZIP",
+        type="zip",
+        help="Upload a small existing project when you want the agent to understand and update it.",
+    )
+    repair_attempts = st.slider(
+        "Maximum AI repair attempts",
+        min_value=1,
+        max_value=3,
+        value=2,
+        help="More attempts can fix additional errors but take longer on a laptop.",
+    )
+    run_minimal_tests = st.checkbox(
+        "Run optional minimal tests",
+        value=False,
+        help="Checks registered routes and the generated page without installing PHPUnit.",
+    )
+    include_deployment = st.checkbox(
+        "Add lightweight deployment files",
+        value=True,
+        help="Adds an Nginx example and a beginner-friendly deployment guide.",
+    )
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -46,7 +69,14 @@ if st.button("Generate PHP project", type="primary"):
         agent = SimplePHPAgent(Path(__file__).parent, llm, vector_store)
         with st.status("Building CodeIgniter Project") as status:
             try:
-                st.session_state.result = agent.build(prompt)
+                archive_bytes = existing_project.getvalue() if existing_project else None
+                st.session_state.result = agent.build(
+                    prompt,
+                    existing_project=archive_bytes,
+                    repair_attempts=repair_attempts,
+                    run_minimal_tests=run_minimal_tests,
+                    include_deployment=include_deployment,
+                )
                 if st.session_state.result["status"] == "working":
                     preview = preview_server.start(st.session_state.result["workspace"])
                     st.session_state.result["preview_url"] = preview["url"]
@@ -73,6 +103,8 @@ if result:
         st.write("Features:")
         for feature in result["features"]:
             st.write(f"- {feature}")
+        if result.get("imported_files"):
+            st.write("Existing project files imported:", len(result["imported_files"]))
     with preview_tab:
         preview_url = result.get("preview_url")
         preview_error = result.get("preview_error")
@@ -120,3 +152,11 @@ if result:
                 st.subheader(f"Error {number}: {error.get('kind', 'unknown')}")
                 st.code(error["output"])
         st.write("Correction attempts:", len(result["attempts"]))
+        if result.get("tests_enabled"):
+            st.subheader("Minimal tests")
+            for test in result.get("test_results", []):
+                if test["passed"]:
+                    st.success(test["name"])
+                else:
+                    st.error(test["name"])
+                st.code(test["output"])

@@ -147,6 +147,48 @@ class CodeIgniterRunner:
             return [webpage_error]
         return []
 
+    def run_minimal_tests(self, workspace):
+        results = []
+        errors = []
+        routes = self.run_command(["php", "spark", "routes"], workspace)
+        routes_passed = routes["return_code"] == 0 and "GET" in routes["output"]
+        results.append({
+            "name": "CodeIgniter route list",
+            "passed": routes_passed,
+            "output": routes["output"] or "No routes were displayed.",
+        })
+        if not routes_passed:
+            routes["kind"] = "code"
+            errors.append(routes)
+            return results, errors
+        asset_problems = []
+        for relative in ("public/css/app.css", "public/js/app.js"):
+            if not Path(workspace).joinpath(relative).is_file():
+                asset_problems.append(f"Missing {relative}")
+        assets_passed = not asset_problems
+        results.append({
+            "name": "Frontend asset files",
+            "passed": assets_passed,
+            "output": "CSS and JavaScript files exist." if assets_passed else "\n".join(asset_problems),
+        })
+        if not assets_passed:
+            errors.append({
+                "command": ["minimal-test", "assets"],
+                "return_code": 1,
+                "output": "\n".join(asset_problems),
+                "kind": "code",
+            })
+            return results, errors
+        webpage_error = self.check_webpage(workspace)
+        results.append({
+            "name": "Homepage smoke test",
+            "passed": webpage_error is None,
+            "output": "The homepage returned valid HTML." if webpage_error is None else webpage_error["output"],
+        })
+        if webpage_error:
+            errors.append(webpage_error)
+        return results, errors
+
     def check_php_syntax(self, workspace, generated_files=None):
         errors = []
         if generated_files:
@@ -177,9 +219,10 @@ class CodeIgniterRunner:
         return None
 
     def check_webpage(self, workspace):
+        port = self.available_port()
         command = ["php", "spark", "serve", 
                    "--host", "127.0.0.1",
-                   "--port", "8080"
+                   "--port", str(port)
         ]
         try:
             server = subprocess.Popen(
@@ -210,7 +253,7 @@ class CodeIgniterRunner:
                     }
                     break
                 try:
-                    response = urlopen("http://127.0.0.1:8080", timeout=2)
+                    response = urlopen(f"http://127.0.0.1:{port}", timeout=2)
                     html = response.read().decode("utf-8", errors="replace")
                     failure_words = ("Whoops!", "Fatal error", "Parse error", "DatabaseException")
                     if response.status >= 400:
@@ -265,6 +308,11 @@ class CodeIgniterRunner:
         if error:
             error["output"] += ("\n\nSERVER OUTPUT:\n" + server_output + "\n\nCODEIGNITER LOG:\n" + self.read_latest_log(workspace))
         return error
+
+    def available_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+            server_socket.bind(("127.0.0.1", 0))
+            return server_socket.getsockname()[1]
 
     def read_latest_log(self, workspace):
         log_directory = Path(workspace) / "writable" / "logs"

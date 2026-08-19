@@ -4,6 +4,7 @@ import shutil
 import json
 from pathlib import Path
 from .runner import CodeIgniterRunner
+from .project_archive import extract_project_zip
 
 class SimplePHPAgent:
     def __init__(self, root, llm, vector_store=None):
@@ -14,13 +15,19 @@ class SimplePHPAgent:
         self.template_dir = self.root / "templates" / "codeigniter-base"
         self.runner = CodeIgniterRunner()
 
-    def build(self, prompt):
-        knowledge = self.retrieve(prompt)
-        plan = self.create_plan(prompt, knowledge)
+    def build(self, prompt, existing_project=None, repair_attempts=2, run_minimal_tests=False, include_deployment=True):
+        repair_attempts = max(1, min(3, int(repair_attempts)))
+        workspace = self.create_workspace()
+        imported_files = []
+        if existing_project:
+            imported_files = extract_project_zip(existing_project, workspace)
+        project_context = self.read_project_context(workspace, imported_files) if imported_files else ""
+        retrieval_prompt = prompt + "\n" + project_context[:3000]
+        knowledge = self.retrieve(retrieval_prompt)
+        plan = self.create_plan(prompt, knowledge, project_context)
         plan = self.prepare_plan(plan, prompt)
         self.validate_plan(plan)
-        workspace = self.create_workspace()
-        files = self.generate_code(prompt, plan, knowledge)
+        files = self.generate_code(prompt, plan, knowledge, project_context)
         planned_files = set(plan["files"])
         generated_files = set(files)
         missing_files = planned_files - generated_files
@@ -30,11 +37,18 @@ class SimplePHPAgent:
         if extra_files:
             raise ValueError("The LLM generated unplanned files: " + ", ".join(sorted(extra_files)))
         self.write_files(workspace, files)
+        support_files = {}
+        if include_deployment:
+            support_files = self.deployment_files()
+            self.write_files(workspace, support_files)
         attempts = []
+        test_results = []
         errors = self.check_generated_code(workspace, plan)
         if not errors:
             errors = self.runner.check(workspace, plan["files"])
-        for attempt in range(1, 2):
+        if not errors and run_minimal_tests:
+            test_results, errors = self.runner.run_minimal_tests(workspace)
+        for attempt in range(1, repair_attempts + 1):
             if not errors:
                 break
             environment_errors = [error for error in errors if error.get("kind") == "environment"]
@@ -54,6 +68,8 @@ class SimplePHPAgent:
             errors = self.check_generated_code(workspace, plan)
             if not errors:
                 errors = self.runner.check(workspace, plan["files"])
+            if not errors and run_minimal_tests:
+                test_results, errors = self.runner.run_minimal_tests(workspace)
         if errors and not any(error.get("kind") == "environment" for error in errors):
             fallback_files = self.basic_fallback_files(plan)
             self.write_files(workspace, fallback_files)
@@ -65,6 +81,8 @@ class SimplePHPAgent:
             errors = self.check_generated_code(workspace, plan)
             if not errors:
                 errors = self.runner.check(workspace, plan["files"])
+            if not errors and run_minimal_tests:
+                test_results, errors = self.runner.run_minimal_tests(workspace)
         if not errors:
             status = "working"
         elif any(error.get("kind") == "environment" for error in errors):
@@ -76,11 +94,16 @@ class SimplePHPAgent:
             "features": plan.get("features", []),
             "plan": plan,
             "knowledge": knowledge,
-            "files": self.read_generated_files(workspace, plan),
+            "files": self.read_result_files(workspace, plan, support_files),
             "workspace": str(workspace),
             "status": status,
             "errors": errors,
             "attempts": attempts,
+            "imported_files": imported_files,
+            "tests_enabled": run_minimal_tests,
+            "test_results": test_results,
+            "repair_limit": repair_attempts,
+            "deployment_included": include_deployment,
         }
 
     def retrieve(self, prompt):
@@ -113,7 +136,7 @@ class SimplePHPAgent:
             sections.append(f"SOURCE: {item['source']}\n{text}")
         return "\n\n".join(sections)
     
-    def create_plan(self, prompt, knowledge):
+    def create_plan(self, prompt, knowledge, project_context=""):
         system_prompt = """
         You are a beginner-friendly PHP and CodeIgniter planner.
 
@@ -135,13 +158,15 @@ class SimplePHPAgent:
         Rules:
         - Use CodeIgniter 4.
         - Keep the project small.
-        - Plan no more than 10 application files.
+        - Plan no more than 10 application files so the application can reserve two frontend asset files.
         - Use controllers, models, views, routes and migrations.
         - Do not put the primary key in an entity's fields list; it is added automatically.
         - Use exact CodeIgniter directory capitalization such as app/Controllers, app/Models, app/Views and app/Database/Migrations.
         - Do not include vendor files.
         - Do not include framework source files.
-        - Do not include automated test files.
+        - For a webpage, include public/css/app.css and public/js/app.js.
+        - Do not include automated test files or deployment files; the application adds those separately.
+        - When existing project code is supplied, preserve its useful structure and plan only files that must be created or changed.
         """
 
         user_prompt = f"""
@@ -152,6 +177,10 @@ class SimplePHPAgent:
         RELEVANT KNOWLEDGE:
 
         {self.knowledge_text(knowledge)}
+
+        EXISTING PROJECT CODE:
+
+        {project_context}
         """
         return self.llm.generate_json(system_prompt, user_prompt)
 
@@ -180,7 +209,7 @@ class SimplePHPAgent:
             filename.startswith(("app/Controllers/", "app/Views/"))
             for filename in files if isinstance(filename, str)
         )
-        if needs_routes and "app/Config/Routes.php" not in files and len(files) < 10:
+        if needs_routes and "app/Config/Routes.php" not in files and len(files) < 12:
             files.append("app/Config/Routes.php")
         needs_view = any(
             filename.startswith("app/Controllers/")
@@ -190,7 +219,7 @@ class SimplePHPAgent:
             filename.startswith("app/Views/")
             for filename in files if isinstance(filename, str)
         )
-        if needs_view and not has_view and len(files) < 10:
+        if needs_view and not has_view and len(files) < 12:
             files.append("app/Views/index.php")
         database_requested = re.search(
             r"\b(database|mysql|table|stored?|save|crud)\b",
@@ -207,9 +236,21 @@ class SimplePHPAgent:
                     "app/Database/Migrations/"
                     f"2026-01-01-000001_Create{entity}s.php"
                 )
-            if len(files) + len(database_files) > 10:
-                raise ValueError("The database plan needs a model and migration but exceeds 10 files")
+            if len(files) + len(database_files) > 12:
+                raise ValueError("The database plan needs a model and migration but exceeds 12 files")
             files.extend(database_files)
+        has_view = any(
+            filename.startswith("app/Views/")
+            for filename in files if isinstance(filename, str)
+        )
+        if has_view:
+            missing_assets = [
+                asset for asset in ("public/css/app.css", "public/js/app.js")
+                if asset not in files
+            ]
+            if len(files) + len(missing_assets) > 12:
+                raise ValueError("The webpage plan needs CSS and JavaScript but exceeds 12 files")
+            files.extend(missing_assets)
         plan["files"] = list(dict.fromkeys(files))
         return plan
     
@@ -221,20 +262,22 @@ class SimplePHPAgent:
             raise ValueError("The plan must contain a files list")
         if not files:
             raise ValueError("The LLM returned an empty file plan")
-        if len(files) > 10:
-            raise ValueError("The LLM planned more than 10 files")
+        if len(files) > 12:
+            raise ValueError("The LLM planned more than 12 files")
         if len(files) != len(set(files)):
             raise ValueError("The LLM planned duplicate files")
         for filename in files:
             self.validate_filename(filename)
     
-    def generate_code(self, prompt, plan, knowledge):
+    def generate_code(self, prompt, plan, knowledge, project_context=""):
         system_prompt = """
         Generate one small, complete CodeIgniter 4 file.
         Return code only, with no Markdown fence or explanation.
         Never use Laravel or Illuminate. Never use PHP type declarations.
         Do not add authentication, admin pages or unrequested features.
-        Keep the file under 50 lines and finish every class, method and HTML tag.
+        Keep PHP files under 60 lines and finish every class, method and HTML tag.
+        Build a clean, responsive interface. Keep CSS and JavaScript in public/css/app.css and public/js/app.js.
+        Use plain CSS and browser JavaScript only; do not use npm packages, CDNs or frontend frameworks.
         """
         files = {}
         entity = self.primary_entity(plan)
@@ -244,6 +287,8 @@ class SimplePHPAgent:
             User request: {prompt}
             Main entity: {entity}
             {self.file_guidance(filename, entity)}
+            Relevant existing project code:
+            {project_context[:5000]}
             """
             answer = self.llm.generate(
                 system_prompt,
@@ -283,8 +328,23 @@ class SimplePHPAgent:
             )
         if filename.startswith("app/Views/"):
             return (
-                "Output an HTML page, not a class or controller. Loop over $items, "
-                "display the requested fields, and escape values with esc()."
+                "Output a complete accessible HTML5 page, not a class or controller. "
+                "Include a viewport meta tag, link /css/app.css, and load /js/app.js with defer. "
+                "Use semantic header, main, sections, forms and tables where appropriate. "
+                "Loop over $items when data is available and escape values with esc(). "
+                "Add useful class names for styling and no inline CSS or inline JavaScript."
+            )
+        if filename == "public/css/app.css":
+            return (
+                "Generate plain responsive CSS. Style body, a centered main container, headings, "
+                "cards, forms, buttons, tables, empty states and mobile screens. Use CSS variables, "
+                "clear focus styles, readable contrast and no external imports."
+            )
+        if filename == "public/js/app.js":
+            return (
+                "Generate small dependency-free browser JavaScript. Wait for DOMContentLoaded, "
+                "enhance forms safely, ask before destructive actions, and add no feature that "
+                "requires missing HTML or a backend route."
             )
         return "Generate the complete requested file using plain beginner-friendly PHP."
 
@@ -292,8 +352,10 @@ class SimplePHPAgent:
         if filename == "app/Config/Routes.php":
             return 100
         if filename.startswith("app/Views/"):
-            return 260
+            return 420
         if filename.startswith("app/Database/Migrations/"):
+            return 420
+        if filename.endswith((".css", ".js")):
             return 420
         return 280
 
@@ -355,6 +417,10 @@ class SimplePHPAgent:
                 files[filename] = self.basic_migration(filename, table, fields)
             elif filename.startswith("app/Views/"):
                 files[filename] = self.basic_view(entity, fields)
+            elif filename == "public/css/app.css":
+                files[filename] = self.basic_css()
+            elif filename == "public/js/app.js":
+                files[filename] = self.basic_javascript()
         return files
 
     def basic_migration(self, filename, table, fields):
@@ -397,20 +463,52 @@ class SimplePHPAgent:
         return (
             "<!doctype html>\n"
             "<html lang=\"en\">\n"
-            "<head><meta charset=\"utf-8\"><title>"
-            f"{entity} List</title></head>\n"
+            "<head>\n"
+            "    <meta charset=\"utf-8\">\n"
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            f"    <title>{entity} List</title>\n"
+            "    <link rel=\"stylesheet\" href=\"/css/app.css\">\n"
+            "    <script src=\"/js/app.js\" defer></script>\n"
+            "</head>\n"
             "<body>\n"
+            "<main class=\"container\">\n"
             f"    <h1>{entity} List</h1>\n"
-            "    <table border=\"1\">\n"
+            "    <div class=\"table-wrap\"><table>\n"
             f"        <thead><tr>\n{headings}\n        </tr></thead>\n"
             "        <tbody>\n"
             "        <?php foreach ($items as $item): ?>\n"
             f"            <tr>\n{cells}\n            </tr>\n"
             "        <?php endforeach; ?>\n"
             "        </tbody>\n"
-            "    </table>\n"
+            "    </table></div>\n"
+            "</main>\n"
             "</body>\n"
             "</html>\n"
+        )
+
+    def basic_css(self):
+        return (
+            ":root { --ink: #172033; --accent: #2563eb; --surface: #ffffff; --line: #dbe2ea; }\n"
+            "* { box-sizing: border-box; }\n"
+            "body { margin: 0; background: #f4f7fb; color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }\n"
+            ".container { width: min(960px, calc(100% - 2rem)); margin: 3rem auto; padding: 2rem; background: var(--surface); border-radius: 16px; box-shadow: 0 12px 35px #17203314; }\n"
+            "h1 { margin-top: 0; } .table-wrap { overflow-x: auto; }\n"
+            "table { width: 100%; border-collapse: collapse; } th, td { padding: .8rem; border-bottom: 1px solid var(--line); text-align: left; }\n"
+            "button, .button { padding: .7rem 1rem; border: 0; border-radius: 8px; background: var(--accent); color: white; cursor: pointer; }\n"
+            "input, select, textarea { width: 100%; padding: .7rem; border: 1px solid var(--line); border-radius: 8px; }\n"
+            ":focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }\n"
+            "@media (max-width: 600px) { .container { margin: 1rem auto; padding: 1rem; } }\n"
+        )
+
+    def basic_javascript(self):
+        return (
+            "document.addEventListener('DOMContentLoaded', function () {\n"
+            "    document.querySelectorAll('[data-confirm]').forEach(function (element) {\n"
+            "        element.addEventListener('click', function (event) {\n"
+            "            if (!window.confirm(element.dataset.confirm)) event.preventDefault();\n"
+            "        });\n"
+            "    });\n"
+            "});\n"
         )
 
     def clean_file_content(self, answer, filename):
@@ -491,6 +589,64 @@ class SimplePHPAgent:
         for folder in ("cache", "logs", "session", "uploads"):
             workspace.joinpath("writable", folder).mkdir(parents=True, exist_ok=True)
         return workspace
+
+    def read_project_context(self, workspace, imported_files):
+        workspace = Path(workspace)
+        candidates = []
+        allowed_extensions = {".php", ".css", ".js", ".json", ".md"}
+        priority_folders = ("app/Controllers/", "app/Models/", "app/Views/", "app/Config/Routes.php")
+        ordered_files = sorted(
+            imported_files,
+            key=lambda filename: (not filename.startswith(priority_folders), filename),
+        )
+        for filename in ordered_files:
+            path = workspace / filename
+            if not path.is_file() or path.suffix.lower() not in allowed_extensions:
+                continue
+            if path.stat().st_size > 50000:
+                continue
+            candidates.append((filename, path))
+        sections = []
+        total_length = 0
+        for relative, path in candidates[:30]:
+            contents = path.read_text(encoding="utf-8", errors="replace")[:2500]
+            section = f"FILE: {relative}\n{contents}"
+            if total_length + len(section) > 12000:
+                break
+            sections.append(section)
+            total_length += len(section)
+        return "\n\n".join(sections)
+
+    def deployment_files(self):
+        return {
+            "DEPLOYMENT.md": (
+                "# Simple deployment guide\n\n"
+                "This project is generated for learning. Review its security before publishing it.\n\n"
+                "1. Install PHP 8.2 or newer, Composer, MySQL, and Nginx on the server.\n"
+                "2. Upload the project and run `composer install --no-dev --optimize-autoloader`.\n"
+                "3. Copy `env` to `.env`, set `CI_ENVIRONMENT = production`, and add database values.\n"
+                "4. Point the web server document root to the project's `public/` directory.\n"
+                "5. Make `writable/` writable by the web-server user.\n"
+                "6. Run `php spark migrate --all`, then configure HTTPS.\n"
+                "7. Replace `example.test` in `deploy/nginx.conf` and enable that server block.\n\n"
+                "Never commit `.env`, database passwords, logs, uploaded files, or `vendor/`.\n"
+            ),
+            "deploy/nginx.conf": (
+                "server {\n"
+                "    listen 80;\n"
+                "    server_name example.test;\n"
+                "    root /var/www/php-project/public;\n"
+                "    index index.php;\n\n"
+                "    location / { try_files $uri $uri/ /index.php?$query_string; }\n\n"
+                "    location ~ \\.php$ {\n"
+                "        include fastcgi_params;\n"
+                "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+                "        fastcgi_pass unix:/run/php/php8.2-fpm.sock;\n"
+                "    }\n\n"
+                "    location ~ /\\. { deny all; }\n"
+                "}\n"
+            ),
+        }
     
     def validate_filename(self, filename):
         if not isinstance(filename, str):
@@ -500,8 +656,9 @@ class SimplePHPAgent:
             raise ValueError("Absolute paths are not allowed")
         if ".." in relative.parts:
             raise ValueError("Parent-directory paths are not allowed")
-        allowed_folders = ("app/", "public/", "writable/")
-        if not filename.startswith(allowed_folders):
+        allowed_folders = ("app/", "public/", "writable/", "deploy/")
+        allowed_files = ("DEPLOYMENT.md",)
+        if not filename.startswith(allowed_folders) and filename not in allowed_files:
             raise ValueError(f"Generated path is not allowed: {filename}")
     
     def safe_path(self, workspace, filename):
@@ -529,6 +686,10 @@ class SimplePHPAgent:
                 problems.append("file is not a CodeIgniter migration")
             if filename.startswith("app/Views/") and "namespace App\\Controllers" in contents:
                 problems.append("view contains controller code")
+            if filename.startswith("app/Views/") and "public/css/app.css" in plan["files"] and "app.css" not in contents:
+                problems.append("view does not load app.css")
+            if filename.startswith("app/Views/") and "public/js/app.js" in plan["files"] and "app.js" not in contents:
+                problems.append("view does not load app.js")
             if re.search(r"function\s+\w+\s*\([^)]*\b(?:array|string|int|float|bool)\s+\$", contents):
                 problems.append("PHP parameter type declaration")
             if problems:
@@ -566,7 +727,7 @@ class SimplePHPAgent:
                     filename for filename in plan["files"]
                     if filename.startswith("app/Database/Migrations/")
                 ]
-            elif "serve" in commands:
+            elif "serve" in commands or "routes" in commands:
                 targets = [
                     filename for filename in plan["files"]
                     if filename == "app/Config/Routes.php"
@@ -597,6 +758,14 @@ class SimplePHPAgent:
     def read_generated_files(self, workspace, plan):
         files = {}
         for filename in plan.get("files", []):
+            path = self.safe_path(workspace, filename)
+            if path.is_file():
+                files[filename] = path.read_text(encoding="utf-8")
+        return files
+
+    def read_result_files(self, workspace, plan, support_files):
+        files = self.read_generated_files(workspace, plan)
+        for filename in support_files:
             path = self.safe_path(workspace, filename)
             if path.is_file():
                 files[filename] = path.read_text(encoding="utf-8")

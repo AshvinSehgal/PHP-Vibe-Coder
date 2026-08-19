@@ -37,28 +37,47 @@ class VectorStore:
             normalize_embeddings=True,
             show_progress_bar=False,
         )
+        result_count = self.collection.count()
         result = self.collection.query(
             query_embeddings=query_embedding.tolist(),
-            n_results=12,
+            n_results=min(30, result_count),
             include=["documents", "metadatas", "distances"],
         )
         documents = result["documents"][0]
         metadatas = result["metadatas"][0]
         distances = result["distances"][0]
+        guidance = self.collection.query(
+            query_embeddings=query_embedding.tolist(),
+            n_results=min(10, result_count),
+            where={"category": "project-guidance"},
+            include=["documents", "metadatas", "distances"],
+        )
+        documents.extend(guidance["documents"][0])
+        metadatas.extend(guidance["metadatas"][0])
+        distances.extend(guidance["distances"][0])
         query_words = self.words(prompt)
         matches = []
+        seen = set()
         for document, metadata, distance in zip(documents, metadatas, distances):
+            if metadata.get("category") == "project-guidance":
+                source_key = (metadata.get("source"), "guidance")
+            else:
+                source_key = (metadata.get("source"), metadata.get("chunk"))
+            if source_key in seen:
+                continue
+            seen.add(source_key)
             document_words = self.words(document)
             keyword_matches = len(query_words & document_words)
             semantic_score = 1 / (1 + distance)
             keyword_score = keyword_matches / max(1, len(query_words))
+            guidance_score = 0.3 if metadata.get("category") == "project-guidance" else 0
             matches.append({
                 "source": metadata.get(
                     "source",
                     "documentation",
                 ),
                 "text": document,
-                "score": semantic_score + keyword_score,
+                "score": semantic_score + keyword_score + guidance_score,
                 "category": metadata.get(
                     "category",
                     "unknown",

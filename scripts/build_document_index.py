@@ -9,7 +9,11 @@ from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
 root = Path(__file__).resolve().parents[1]
-docs_directory = root / "docs"
+source_directories = (
+    (root / "docs", "docs"),
+    (root / "knowledge", "knowledge"),
+    (root / "rag_sources", "project-guidance"),
+)
 database_directory = root / "storage" / "vector_database"
 collection_name = "php_docs"
 embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
@@ -58,25 +62,29 @@ if __name__ == "__main__":
     documents = []
     metadatas = []
     identifiers = []
-    for path in docs_directory.rglob("*"):
-        if not path.is_file():
+    for source_directory, source_group in source_directories:
+        if not source_directory.is_dir():
             continue
-        if path.suffix.lower() not in allowed_extensions:
-            continue
-        source = str(path.relative_to(docs_directory))
-        text = read_document(path)
-        for number, chunk in enumerate(split_into_chunks(text)):
-            identifier_text = f"{source}:{number}:{chunk}"
-            identifier = sha256(identifier_text.encode("utf-8")).hexdigest()
-            documents.append(chunk)
-            identifiers.append(identifier)
-            metadatas.append({
-                "source": source,
-                "category": path.parts[-2],
-                "chunk": number,
-            })
+        for path in source_directory.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allowed_extensions:
+                continue
+            relative = path.relative_to(source_directory)
+            source = f"{source_group}/{relative}"
+            text = read_document(path)
+            for number, chunk in enumerate(split_into_chunks(text)):
+                identifier_text = f"{source}:{number}:{chunk}"
+                identifier = sha256(identifier_text.encode("utf-8")).hexdigest()
+                documents.append(chunk)
+                identifiers.append(identifier)
+                metadatas.append({
+                    "source": source,
+                    "category": source_group,
+                    "chunk": number,
+                })
     if not documents:
-        raise SystemExit("No doc files were found in the docs folder.")
+        raise SystemExit("No supported files were found in docs, knowledge, or rag_sources.")
     model = SentenceTransformer(
         embedding_model_name,
         device="cpu",
